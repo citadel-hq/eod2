@@ -3,78 +3,143 @@ import json
 import re
 import os
 import requests
+import logging
 import numpy as np
-from requests.exceptions import ChunkedEncodingError
 import pandas as pd
+import importlib.util
+from zoneinfo import ZoneInfo
+from requests.exceptions import ChunkedEncodingError
 from nse import NSE
 from pathlib import Path
 from datetime import datetime, timedelta
 from defs.Config import Config
-from typing import cast, Any, Dict, List, Optional, Tuple
+from typing import cast, Any, Dict, List, Optional, Tuple, Union, Type
+from types import ModuleType
+
+try:
+    import tzlocal
+except ModuleNotFoundError:
+    pip = "pip" if "win" in sys.platform else "pip3"
+    exit(f"tzlocal package is required\nRun: {pip} install tzlocal")
+
+
+def configure_logger(name: str) -> logging.Logger:
+    """Return a logger instance by name
+
+    Creates a file handler to log messages with level WARNING and above
+
+    Creates a stream handler to log messages with level INFO and above
+
+    Parameters:
+    name (str): Pass __name__ for module level logger
+    """
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+
+    stdout_handler = logging.StreamHandler()
+    stdout_handler.setLevel(logging.INFO)
+
+    stdout_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    file_handler = logging.FileHandler(DIR / "error.log")
+    file_handler.setLevel(logging.WARNING)
+
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+    )
+
+    logger.addHandler(stdout_handler)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def load_module(module_str: str) -> Union[ModuleType, Type]:
+    """
+    Load a module specified by the given string.
+
+    Arguments
+    module_str (str): Module filepath, optionally adding the class name
+        with format <filePath>:<className>
+
+    Raises:
+    ModuleNotFoundError: If module is not found
+    AttributeError: If class name is not found in module.
+
+    Returns: ModuleType
+    """
+
+    class_name = None
+    module_path = module_str
+
+    if "|" in module_str:
+        module_path, class_name = module_str.split("|")
+
+    module_path = Path(module_path).expanduser().resolve()
+
+    spec = importlib.util.spec_from_file_location(module_path.stem, module_path)
+
+    if not spec or not spec.loader:
+        raise ModuleNotFoundError(f"Could not load module {module_path.stem}")
+
+    module = importlib.util.module_from_spec(spec)
+
+    sys.modules[module_path.stem] = module
+
+    spec.loader.exec_module(module)
+
+    return getattr(module, class_name) if class_name else module
 
 
 class Dates:
     "A class for date related functions in EOD2"
 
     def __init__(self, lastUpdate: str):
-        self.today = datetime.combine(datetime.today(), datetime.min.time())
-        self.dt = self.lastUpdate = datetime.fromisoformat(lastUpdate)
+
+        today = datetime.now(tz_IN)
+
+        self.today = datetime.combine(today, datetime.min.time())
+
+        dt = datetime.fromisoformat(lastUpdate).astimezone(tz_IN)
+
+        self.dt = self.lastUpdate = dt
+
         self.pandasDt = self.dt.strftime("%Y-%m-%d")
 
     def nextDate(self):
         """Set the next trading date and return True.
         If its a future date, return False"""
 
-        curTime = datetime.today()
+        curTime = datetime.now(tz_IN)
         self.dt = self.dt + timedelta(1)
 
         if self.dt > curTime:
-            print("All Up To Date")
+            logger.info("All Up To Date")
             return False
 
         if self.dt.day == curTime.day and curTime.hour < 18:
-            print("All Up To Date. Check again after 7pm for today's EOD data")
+            # Display the users local time
+            local_time = curTime.replace(hour=19, minute=0).astimezone(tz_local)
+
+            t_str = local_time.strftime("%I:%M%p")  # 07:00PM
+
+            logger.info(
+                f"All Up To Date. Check again after {t_str} for today's EOD data"
+            )
             return False
 
         self.pandasDt = self.dt.strftime("%Y-%m-%d")
         return True
 
 
-if "win" in sys.platform:
-    # enable color support in Windows
-    os.system("color")
-
-DIR = Path(__file__).parents[1]
-DAILY_FOLDER = DIR / "eod2_data" / "daily"
-ISIN_FILE = DIR / "eod2_data" / "isin.csv"
-AMIBROKER_FOLDER = DIR / "eod2_data" / "amibroker"
-
-META_FILE = DIR / "eod2_data" / "meta.json"
-
-meta: Dict = json.loads(META_FILE.read_bytes())
-
-config = Config()
-
-isin = pd.read_csv(ISIN_FILE, index_col="ISIN")
-
-headerText = (
-    b"Date,Open,High,Low,Close,Volume,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
-)
-
-splitRegex = re.compile(r"(\d+\.?\d*)[\/\- a-z\.]+(\d+\.?\d*)")
-
-bonusRegex = re.compile(r"(\d+) ?: ?(\d+)")
-
-hasLatestHolidays = False
-
-# initiate the dates class from utils.py
-dates = Dates(meta["lastUpdate"])
-
-# Avoid side effects in case this file is directly executed
-# instead of being imported
-if __name__ != "__main__":
-    if config.AMIBROKER and not AMIBROKER_FOLDER.exists():
-        AMIBROKER_FOLDER.mkdir()
+def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    # Log the unhandled exception
+    logger.critical(
+        "Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback)
+    )
 
 
 def getMuhuratHolidayInfo(holidays: Dict[str, List[dict]]) -> dict:
@@ -89,15 +154,21 @@ def getMuhuratHolidayInfo(holidays: Dict[str, List[dict]]) -> dict:
 def downloadSpecialSessions() -> Tuple[datetime, ...]:
     base_url = "https://raw.githubusercontent.com/BennyThadikaran/eod2_data"
 
-    res = requests.get(f"{base_url}/main/special_sessions.txt")
+    err_text = "special_sessions.txt download failed. Please try again later."
 
-    if res.ok:
-        return tuple(
-            datetime.fromisoformat(x) for x in res.text.strip().split("\n")
-        )
+    try:
+        res = requests.get(f"{base_url}/main/special_sessions.txt")
+    except Exception as e:
+        logger.exception(err_text, exc_info=e)
+        exit()
 
-    raise ConnectionError(
-        f"special_sessions.txt download failed. {res.status_code}: {res.reason}"
+    if not res.ok:
+        logger.exception(f"{err_text} {res.status_code}: {res.reason}")
+        exit()
+
+    return tuple(
+        datetime.fromisoformat(x).astimezone(tz_IN)
+        for x in res.text.strip().split("\n")
     )
 
 
@@ -107,13 +178,14 @@ def getHolidayList(nse: NSE):
     try:
         data = nse.holidays(type=nse.HOLIDAY_TRADING)
     except Exception as e:
-        exit(f"{e!r}\nFailed to download holidays")
+        logger.warning(f"Failed to download holidays - {e}")
+        exit()
 
     # CM pertains to capital market or equity holidays
     data["CM"].append(getMuhuratHolidayInfo(data))
 
     data = {k["tradingDate"]: k["description"] for k in data["CM"]}
-    print("NSE Holiday list updated")
+    logger.info("NSE Holiday list updated")
 
     return data
 
@@ -154,10 +226,11 @@ def checkForHolidays(nse: NSE, special_sessions: Tuple[datetime, ...]):
 
     if curDt in meta["holidays"]:
         if not isToday:
-            print(f'{curDt} Market Holiday: {meta["holidays"][curDt]}')
+            logger.info(f'{curDt} Market Holiday: {meta["holidays"][curDt]}')
             return True
 
-        exit(f'Market Holiday: {meta["holidays"][curDt]}')
+        logger.info(f'Market Holiday: {meta["holidays"][curDt]}')
+        exit()
 
     return False
 
@@ -173,7 +246,7 @@ def validateNseActionsFile(nse: NSE):
         segment = "sme" if action == "sme" else "equities"
 
         if f"{action}Actions" not in meta:
-            print(f"Downloading NSE {action.upper()} actions")
+            logger.info(f"Downloading NSE {action.upper()} actions")
 
             try:
                 meta[f"{action}Actions"] = nse.actions(
@@ -182,20 +255,24 @@ def validateNseActionsFile(nse: NSE):
                     to_date=dates.dt + timedelta(8),
                 )
             except Exception as e:
-                exit(f"{e!r}\nFailed to download {action} actions")
+                logger.warning(f"Failed to download {action} actions - {e}")
+                exit()
 
             meta[f"{action}ActionsExpiry"] = (
                 dates.dt + timedelta(7)
             ).isoformat()
         else:
-            expiryDate = datetime.fromisoformat(meta[f"{action}ActionsExpiry"])
+            expiryDate = datetime.fromisoformat(
+                meta[f"{action}ActionsExpiry"]
+            ).astimezone(tz_IN)
+
             newExpiry = (expiryDate + timedelta(7)).isoformat()
 
             # Update every 7 days from last download
             if dates.dt < expiryDate:
                 continue
 
-            print(f"Updating NSE {action.upper()} actions")
+            logger.info(f"Updating NSE {action.upper()} actions")
 
             try:
                 meta[f"{action}Actions"] = nse.actions(
@@ -204,7 +281,8 @@ def validateNseActionsFile(nse: NSE):
                     to_date=expiryDate + timedelta(8),
                 )
             except Exception as e:
-                exit(f"{e!r}\nFailed to update {action} actions")
+                logger.warning(f"Failed to update {action} actions - {e}")
+                exit()
 
             meta[f"{action}ActionsExpiry"] = newExpiry
 
@@ -215,19 +293,20 @@ def updatePendingDeliveryData(nse: NSE, date: str):
     """
 
     dt = datetime.fromisoformat(date)
-    daysSinceFailure = (datetime.today() - dt).days
+    daysSinceFailure = (datetime.now(tz_IN) - dt).days
+    error_context = None
+
+    dt = dt.replace(tzinfo=None)
 
     try:
         FILE = nse.deliveryBhavcopy(dt)
     except (RuntimeError, Exception):
         if daysSinceFailure == 5:
-            print("Max Failed: Aborting Future attempts")
+            logger.warning("Max attempts reached: Aborting Future attempts")
             return True
 
-        print(f"{dt:%d %b}: Delivery report not yet updated.")
+        logger.info(f"{dt:%d %b}: Delivery report not yet updated.")
         return False
-
-    print(f"Updating delivery report dated {dt:%d %b %Y}:", end=" ", flush=True)
 
     try:
         df = pd.read_csv(FILE, index_col="SYMBOL")
@@ -251,13 +330,14 @@ def updatePendingDeliveryData(nse: NSE, date: str):
         ]
 
         for sym in df.index:
+            error_context = f"{sym} - {dt}"
             DAILY_FILE = DAILY_FOLDER / f"{sym.lower()}.csv"
 
             if not DAILY_FILE.exists():
                 continue
 
             dailyDf = pd.read_csv(
-                DAILY_FILE, index_col="Date", parse_dates=True
+                DAILY_FILE, index_col="Date", parse_dates=["Date"]
             )
 
             if dt not in dailyDf.index:
@@ -277,14 +357,20 @@ def updatePendingDeliveryData(nse: NSE, date: str):
             dailyDf.loc[dt, "QTY_PER_TRADE"] = avgTrdCnt
             dailyDf.loc[dt, "DLV_QTY"] = dq
             dailyDf.to_csv(DAILY_FILE)
+
+        if hook and hasattr(hook, "updatePendingDeliveryData"):
+            hook.updatePendingDeliveryData(df, dt)
     except Exception as e:
-        print(repr(e))
+        logger.exception(
+            f"Error updating delivery report dated {dt:%d %b %Y} - {error_context}",
+            exc_info=e,
+        )
         FILE.unlink()
         return False
 
     meta["DLV_PENDING_DATES"].remove(date)
     FILE.unlink()
-    print("✓ Done")
+    logger.info(f"Updating delivery report dated {dt:%d %b %Y}: ✓ Done")
     return True
 
 
@@ -302,11 +388,11 @@ def updateAmiBrokerRecords(nse: NSE):
     dt = lastUpdate - timedelta(config.AMI_UPDATE_DAYS)
     totalDays = config.AMI_UPDATE_DAYS
 
-    print(
-        f"Fetching bhavcopy for last {totalDays} days",
-        "and converting to AmiBroker format.\n"
-        "This is a one time process. It will take a few minutes.",
+    logger.info(
+        f"Fetching bhavcopy for last {totalDays} days, to convert to AmiBroker format."
     )
+
+    logger.info("This is a one time process. It will take a few minutes.")
 
     while dt < lastUpdate:
         dt += timedelta(1)
@@ -323,7 +409,8 @@ def updateAmiBrokerRecords(nse: NSE):
             except (RuntimeError, FileNotFoundError):
                 continue
             except ChunkedEncodingError as e:
-                exit(f"{e}\nPlease try again")
+                logger.warning(f"{e} - Please try again.")
+                exit()
 
         toAmiBrokerFormat(bhavFile)
 
@@ -333,7 +420,7 @@ def updateAmiBrokerRecords(nse: NSE):
         pctComplete = int(daysComplete / totalDays * 100)
         print(f"{pctComplete} %", end="\r" * 5, flush=True)
 
-    print("\nDone")
+    logger.info("Amibroker file updated")
 
 
 def toAmiBrokerFormat(file: Path):
@@ -373,6 +460,8 @@ def toAmiBrokerFormat(file: Path):
 def updateNseEOD(bhavFile: Path, deliveryFile: Optional[Path]):
     """Update all stocks with latest price data from bhav copy"""
 
+    logger.info("Starting Data Sync")
+
     isinUpdated = False
 
     df = pd.read_csv(bhavFile, index_col="ISIN")
@@ -396,7 +485,7 @@ def updateNseEOD(bhavFile: Path, deliveryFile: Optional[Path]):
     ]
 
     if config.AMIBROKER:
-        print("Converting to AmiBroker format")
+        logger.info("Converting to AmiBroker format")
         toAmiBrokerFormat(bhavFile)
 
     if deliveryFile:
@@ -471,11 +560,11 @@ def updateNseEOD(bhavFile: Path, deliveryFile: Optional[Path]):
             try:
                 OLD_FILE.rename(SYM_FILE)
             except FileNotFoundError:
-                print(
-                    f"WARN: Renaming daily/{old}.csv to {new}.csv. No such file."
+                logger.warning(
+                    f"Renaming daily/{old}.csv to {new}.csv. No such file."
                 )
 
-            print(f"Name Changed: {old} to {new}")
+            logger.info(f"Name Changed: {old} to {new}")
 
         updateNseSymbol(
             SYM_FILE, t.OPEN, t.HIGH, t.LOW, t.CLOSE, t.TOTTRDQTY, trdCnt, dq
@@ -483,6 +572,8 @@ def updateNseEOD(bhavFile: Path, deliveryFile: Optional[Path]):
 
     if isinUpdated:
         isin.to_csv(ISIN_FILE)
+
+    logger.info("EOD sync complete")
 
 
 def updateNseSymbol(symFile: Path, open, high, low, close, volume, trdCnt, dq):
@@ -503,6 +594,20 @@ def updateNseSymbol(symFile: Path, open, high, low, close, volume, trdCnt, dq):
     with symFile.open("ab") as f:
         f.write(text)
 
+    if hook and hasattr(hook, "updateNseSymbol"):
+        hook.updateNseSymbol(
+            dates.dt,
+            symFile.stem,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            trdCnt,
+            avgTrdCnt,
+            dq,
+        )
+
 
 def getSplit(sym, string):
     """Run a regex search for splits related corporate action and
@@ -511,7 +616,7 @@ def getSplit(sym, string):
     match = splitRegex.search(string)
 
     if match is None:
-        print(f"{sym}: Not Matched. {string}")
+        logger.warning(f"{sym}: Not Matched. {string}")
         return match
 
     return float(match.group(1)) / float(match.group(2))
@@ -524,28 +629,33 @@ def getBonus(sym, string):
     match = bonusRegex.search(string)
 
     if match is None:
-        print(f"{sym}: Not Matched. {string}")
+        logger.warning(f"{sym}: Not Matched. {string}")
         return match
 
     return 1 + int(match.group(1)) / int(match.group(2))
 
 
-def makeAdjustment(symbol: str, adjustmentFactor: float):
+def makeAdjustment(
+    symbol: str, adjustmentFactor: float
+) -> Optional[Tuple[pd.DataFrame, Path]]:
     """Makes adjustment to stock data prior to ex date,
     returning a tuple of pandas pd.DataFrame and filename"""
 
     file = DAILY_FOLDER / f"{symbol.lower()}.csv"
 
     if not file.is_file():
-        print(f"{symbol}: File not found")
+        logger.warning(f"{symbol}: File not found")
         return
 
-    df = pd.read_csv(file, index_col="Date", parse_dates=True, na_filter=False)
+    df = pd.read_csv(file, index_col="Date", parse_dates=["Date"])
 
     last = None
 
-    if dates.dt in df.index:
-        idx = df.index.get_loc(dates.dt)
+    # Remove timezone info as DataFrame index is not timezone aware
+    dt = dates.dt.replace(tzinfo=None)
+
+    if dt in df.index:
+        idx = df.index.get_loc(dt)
 
         last = df.iloc[idx:]
 
@@ -578,6 +688,9 @@ def updateIndice(sym, open, high, low, close, volume):
 
     with file.open("ab") as f:
         f.write(text)
+
+    if hook and hasattr(hook, "updateIndice"):
+        hook.updateIndice(dates.dt, sym, open, high, low, close, volume)
 
 
 def updateIndexEOD(file: Path):
@@ -625,21 +738,27 @@ def updateIndexEOD(file: Path):
     pe = float(df.at["Nifty 50", "P/E"])
 
     if pe >= 25 or pe <= 20:
-        print(f"\033[1;32m### Alert: Nifty PE at {pe}! ###\033[0;94m")
+        logger.info(f"\033[1;32m### Alert: Nifty PE at {pe}! ###\033[0;94m")
     else:
-        print(f"### Nifty PE at {pe} ###")
+        logger.info(f"### Nifty PE at {pe} ###")
+
+    logger.info("Index sync complete.")
 
 
 def adjustNseStocks():
     """Iterates over NSE corporate actions searching for splits or bonus
     on current date and adjust the stock accordingly"""
 
+    logger.info("Making adjustments for splits and bonus")
+
     dtStr = dates.dt.strftime("%d-%b-%Y")
 
     for actions in ("equityActions", "smeActions"):
         # Store all pd.DataFrames with associated files names to be saved to file
         # if no error occurs
-        dfCommits = []
+        df_commits: List[Tuple[pd.DataFrame, Path]] = []
+        post_commits: List[Tuple[str, float]] = []
+        error_context = None
 
         try:
             for act in meta[actions]:
@@ -655,33 +774,46 @@ def adjustNseStocks():
                     sym += "_sme"
 
                 if ("split" in purpose or "splt" in purpose) and ex == dtStr:
+                    error_context = f"{sym} - Split - {dtStr}"
                     adjustmentFactor = getSplit(sym, purpose)
 
                     if adjustmentFactor is None:
                         continue
 
-                    dfCommits.append(makeAdjustment(sym, adjustmentFactor))
+                    commit = makeAdjustment(sym, adjustmentFactor)
 
-                    print(f"{sym}: {purpose}")
+                    if commit:
+                        df_commits.append(commit)
+                        post_commits.append((sym, adjustmentFactor))
+                        logger.info(f"{sym}: {purpose}")
 
                 if "bonus" in purpose and ex == dtStr:
+                    error_context = f"{sym} - Bonus - {dtStr}"
                     adjustmentFactor = getBonus(sym, purpose)
 
                     if adjustmentFactor is None:
                         continue
 
-                    dfCommits.append(makeAdjustment(sym, adjustmentFactor))
+                    commit = makeAdjustment(sym, adjustmentFactor)
 
-                    print(f"{sym}: {purpose}")
+                    if commit:
+                        df_commits.append(commit)
+                        post_commits.append((sym, adjustmentFactor))
+                        logger.info(f"{sym}: {purpose}")
+
         except Exception as e:
+            logging.critical(f"Adjustment Error - Context {error_context}")
             # discard all pd.DataFrames and raise error,
             # so changes can be rolled back
-            dfCommits.clear()
+            df_commits.clear()
             raise e
 
         # commit changes
-        for df, file in dfCommits:
+        for df, file in df_commits:
             df.to_csv(file)
+
+        if hook and hasattr(hook, "makeAdjustment") and post_commits:
+            hook.makeAdjustment(dates.dt, post_commits)
 
 
 def getLastDate(file):
@@ -702,10 +834,45 @@ def getLastDate(file):
             f.seek(0)
 
         # we have the last line
-        lastLine = f.readline().decode()
+        lastLine = f.readline()
 
-    # split the line (Date, O, H, L, C) and get the first item (Date)
-    return lastLine.split(",")[0]
+    # extract date being the first item separated by comma
+    return lastLine[: lastLine.find(b",")].decode()
+
+
+def deleteLastLineByDate(file: Path, date_str: str) -> bool:
+    """
+    Truncate the last line if line starts with date_str
+    """
+
+    # Get the file size
+    file_size = os.path.getsize(file)
+
+    if file_size == 0:
+        return False
+
+    date_bytes = bytes(date_str, encoding="utf-8")
+
+    # Open the file in read-only mode
+    with file.open("r+b") as f:
+
+        # Start searching from the end of the file
+        cur_pos = file_size - 2
+        f.seek(cur_pos)
+
+        # Search backward till the newline character is found
+        while f.read(1) != b"\n":
+            cur_pos -= 1
+
+            try:
+                f.seek(cur_pos)
+            except OSError:
+                break
+
+        if f.read().startswith(date_bytes):
+            f.truncate(cur_pos)
+            return True
+        return False
 
 
 def rollback(folder: Path):
@@ -713,18 +880,15 @@ def rollback(folder: Path):
     pertaining to the current date"""
 
     dt = dates.pandasDt
-    print(f"Rolling back changes from {dt}: {folder}")
+    logger.info(f"Rolling back changes from {dt}: {folder}")
 
     for file in folder.iterdir():
-        df = pd.read_csv(
-            file, index_col="Date", parse_dates=True, na_filter=False
-        )
+        deleteLastLineByDate(file, dt)
 
-        if dt in df.index:
-            df = df.drop(dt)
-            df.to_csv(file)
+    logger.info("Rollback successful")
 
-    print("Rollback successful")
+    if hook and hasattr(hook, "on_error"):
+        hook.on_error()
 
 
 def cleanup(filesLst):
@@ -739,14 +903,71 @@ def cleanup(filesLst):
 def cleanOutDated():
     """Delete CSV files not updated in the last 365 days"""
 
+    logger.info("Cleaning up files")
+
     deadline = dates.today - timedelta(365)
     count = 0
+    removed = []
 
     for file in DAILY_FOLDER.iterdir():
         lastUpdated = datetime.strptime(getLastDate(file), "%Y-%m-%d")
 
         if lastUpdated < deadline:
+            removed.append(file.stem)
             file.unlink()
             count += 1
 
-    print(f"{count} files deleted")
+    logger.info(f"{count} files deleted")
+
+    if hook and hasattr(hook, "cleanOutDated") and removed:
+        hook.cleanOutDated(removed)
+
+
+# Avoid side effects in case this file is directly executed
+# instead of being imported
+if __name__ != "__main__":
+    DIR = Path(__file__).parents[1]
+    DAILY_FOLDER = DIR / "eod2_data" / "daily"
+    ISIN_FILE = DIR / "eod2_data" / "isin.csv"
+    AMIBROKER_FOLDER = DIR / "eod2_data" / "amibroker"
+    META_FILE = DIR / "eod2_data" / "meta.json"
+
+    hasLatestHolidays = False
+
+    splitRegex = re.compile(r"(\d+\.?\d*)[\/\- a-z\.]+(\d+\.?\d*)")
+
+    bonusRegex = re.compile(r"(\d+) ?: ?(\d+)")
+
+    headerText = (
+        b"Date,Open,High,Low,Close,Volume,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+    )
+
+    logger = configure_logger(__name__)
+
+    tz_local = tzlocal.get_localzone()
+    tz_IN = ZoneInfo("Asia/Kolkata")
+
+    if "win" in sys.platform:
+        # enable color support in Windows
+        os.system("color")
+
+    meta: Dict = json.loads(META_FILE.read_bytes())
+
+    config = Config()
+
+    if config.AMIBROKER and not AMIBROKER_FOLDER.exists():
+        AMIBROKER_FOLDER.mkdir()
+
+    hook = None  # INIT_HOOK
+
+    if config.INIT_HOOK:
+        hook = load_module(config.INIT_HOOK)
+
+        if isinstance(hook, Type):
+            # hook is a Class
+            hook = hook()
+
+    isin = pd.read_csv(ISIN_FILE, index_col="ISIN")
+
+    # initiate the dates class from utils.py
+    dates = Dates(meta["lastUpdate"])

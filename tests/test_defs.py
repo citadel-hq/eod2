@@ -3,9 +3,13 @@ from unittest.mock import Mock, patch
 from context import defs
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 DIR = Path(__file__).parent / "test_data"
+tz_IN = ZoneInfo("Asia/Kolkata")
+
+defs.logging.disable(defs.logging.CRITICAL)
 
 
 class TestGetMuhuratHolidayInfo(unittest.TestCase):
@@ -63,13 +67,8 @@ class TestGetHolidayList(unittest.TestCase):
         exc = Exception("Download failed.")
         mock_nse.holidays.side_effect = exc
 
-        with self.assertRaises(SystemExit) as exit_exception:
+        with self.assertRaises(SystemExit):
             defs.getHolidayList(mock_nse)
-
-        self.assertEqual(
-            exit_exception.exception.code,
-            f"{exc!r}\nFailed to download holidays",
-        )
 
 
 class TestCheckForHolidays(unittest.TestCase):
@@ -227,22 +226,19 @@ class TestValidateNseActionsFile(unittest.TestCase):
         exc = Exception("Download Failed")
         mock_nse.actions.side_effect = exc
 
-        with self.assertRaises(SystemExit) as exit_exception:
+        with self.assertRaises(SystemExit):
             defs.validateNseActionsFile(mock_nse)
 
-        expected_exc = f"{exc!r}\nFailed to download equity actions"
-
         mock_nse.actions.assert_called_once()
-        self.assertEqual(exit_exception.exception.code, expected_exc)
 
     @patch.object(defs, "meta", {})
     @patch.object(defs, "dates")
     def test_expired_successful_request(self, _):
         """Actions data expired. Request for NSE actions successful"""
 
-        dt = datetime(2023, 1, 1)
-        expiry = datetime(2023, 1, 1).isoformat()
-        newExpiry = datetime(2023, 1, 8).isoformat()
+        dt = datetime(2023, 1, 1).astimezone(tz_IN)
+        expiry = datetime(2023, 1, 1).astimezone(tz_IN).isoformat()
+        newExpiry = datetime(2023, 1, 8).astimezone(tz_IN).isoformat()
 
         defs.dates.dt = defs.dates.today = dt
         defs.meta = {
@@ -268,8 +264,8 @@ class TestValidateNseActionsFile(unittest.TestCase):
     def test_expired_failed_request(self, _):
         """Actions data expired. Request for NSE actions fails"""
 
-        dt = datetime(2023, 1, 1)
-        expiry = datetime(2023, 1, 1).isoformat()
+        dt = datetime(2023, 1, 1).astimezone(tz_IN)
+        expiry = datetime(2023, 1, 1).astimezone(tz_IN).isoformat()
 
         defs.dates.dt = defs.dates.today = dt
         defs.meta = {
@@ -285,21 +281,18 @@ class TestValidateNseActionsFile(unittest.TestCase):
         exc = Exception("Download Failed")
         mock_nse.actions.side_effect = exc
 
-        with self.assertRaises(SystemExit) as exit_exception:
+        with self.assertRaises(SystemExit):
             defs.validateNseActionsFile(mock_nse)
 
-        expected_exc = f"{exc!r}\nFailed to update equity actions"
-
         mock_nse.actions.assert_called_once()
-        self.assertEqual(exit_exception.exception.code, expected_exc)
 
     @patch.object(defs, "meta", {})
     @patch.object(defs, "dates")
     def test_not_expired(self, _):
         """NSE actions data is fresh. No need to update"""
 
-        dt = datetime(2023, 1, 1)
-        expiry = datetime(2023, 1, 3).isoformat()
+        dt = datetime(2023, 1, 1).astimezone(tz_IN)
+        expiry = datetime(2023, 1, 3).astimezone(tz_IN).isoformat()
 
         defs.dates.dt = defs.dates.today = dt
         meta_obj = {
